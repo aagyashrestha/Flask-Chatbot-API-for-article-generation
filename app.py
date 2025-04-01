@@ -76,7 +76,7 @@ def save_to_google_drive(article_json):
         file_metadata = {
             'name': f'{article_json["title"]}.json',
             'mimeType': 'application/json',
-            'parents': ['1HfcSM7LFWcqtbWzQsPxmLiOroYKPnfHc']  # Replace with your Google Drive Folder ID
+            'parents': ['']  # Replace with your Google Drive Folder ID
         }
         
         media = MediaIoBaseUpload(io.BytesIO(json.dumps(article_json).encode()), mimetype='application/json')
