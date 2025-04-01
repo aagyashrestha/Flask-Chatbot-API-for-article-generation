@@ -17,6 +17,7 @@ SERVICE_ACCOUNT_FILE = "service_account.json"
 # Google Sheets spreadsheet ID and range
 SPREADSHEET_ID = ''  # Replace with your Google Sheets spreadsheet ID
 RANGE_NAME = 'Sheet1!A2:B'  # Replace with the appropriate range in your sheet (columns A and B for topic/description)
+DRIVE_FOLDER_ID = ""
 
 def authenticate_google():
     """ Authenticate Google Sheets and Google Drive services """
@@ -24,8 +25,8 @@ def authenticate_google():
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
-        sheets_service = build("sheets", "v4", credentials=creds)
-        drive_service = build("drive", "v3", credentials=creds)
+        sheets_service = build("sheets", "v4", credentials=creds)  # Build Google Sheets service
+        drive_service = build("drive", "v3", credentials=creds)  # Build Google Drive service
 
         return sheets_service, drive_service
     except Exception as e:
@@ -34,11 +35,11 @@ def authenticate_google():
 def get_google_sheets_data():
     """ Retrieve topics and descriptions from Google Sheets """
     try:
-        sheets_service, _ = authenticate_google()
-        result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()
-        values = result.get('values', [])
+        sheets_service, _ = authenticate_google()  # Authenticate and get sheets service
+        result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()  # Fetch data from Google Sheets
+        values = result.get("values", [])
 
-        topics_descriptions = [{"topic": row[0], "description": row[1]} for row in values if len(row) >= 2]
+        topics_descriptions = [{"topic": row[0], "description": row[1]} for row in values if len(row) >= 2]  # Organize rows into dictionary
         return topics_descriptions
     except Exception as e:
         raise Exception(f"Failed to get Google Sheets data: {str(e)}")
@@ -48,7 +49,7 @@ def generate_article(topic, description):
     try:
         prompt = f"Write an article about {topic} based on this description: {description}. Provide clear sections with headings."
 
-        response = client.chat.completions.create(
+        response = client.chat.completions.create(  # Request completion from OpenAI's GPT-3.5 model
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a professional article writer."},
@@ -58,11 +59,11 @@ def generate_article(topic, description):
             temperature=0.7
         )
 
-        article = response.choices[0].message.content.strip()
-        sections = article.split('\n\n')
+        article = response.choices[0].message.content.strip()  # Extract article content from response
+        sections = article.split("\n\n")  # Split article into sections
         structured_article = {
             "title": topic,
-            "sections": [{"heading": sec.split('\n')[0], "content": '\n'.join(sec.split('\n')[1:])} for sec in sections if sec]
+            "sections": [{"heading": sec.split("\n")[0], "content": "\n".join(sec.split("\n")[1:])} for sec in sections if sec]
         }
         return structured_article
     except Exception as e:
@@ -71,92 +72,56 @@ def generate_article(topic, description):
 def save_to_google_drive(article_json):
     """ Save generated article as a JSON file to a specific folder in Google Drive """
     try:
-        _, drive_service = authenticate_google()
+        _, drive_service = authenticate_google()  # Authenticate and get drive service
 
         file_metadata = {
-            'name': f'{article_json["title"]}.json',
-            'mimeType': 'application/json',
-            'parents': ['']  # Replace with your Google Drive Folder ID
+            "name": f'{article_json["title"]}.json',  # Set the file name
+            "mimeType": "application/json",
+            "parents": [DRIVE_FOLDER_ID]  # Google Drive Folder ID to save the file in
         }
-        
-        media = MediaIoBaseUpload(io.BytesIO(json.dumps(article_json).encode()), mimetype='application/json')
 
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return file.get('id')
+        media = MediaIoBaseUpload(io.BytesIO(json.dumps(article_json).encode()), mimetype="application/json")  # Convert article to JSON and upload
+
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()  # Create the file on Google Drive
+        return file.get("id")  # Return the file ID
     except Exception as e:
         raise Exception(f"Failed to save to Google Drive: {str(e)}")
 
-
-@app.route("/generate_article", methods=["GET"])
-def generate_and_save_article():
-    """ API to generate an article and save it to Google Drive """
+@app.route("/automate_all", methods=["GET"])
+def automate_all():
+    """ Automates the entire process: Fetch from Sheets -> Generate Article -> Save to Drive """
     try:
-        # Fetch topics and descriptions from Google Sheets
+        # Step 1: Fetch topics and descriptions from Google Sheets
         topics_descriptions = get_google_sheets_data()
-
         if not topics_descriptions:
             return jsonify({"error": "No data found in Google Sheets"}), 400
 
-        # Select the first topic and description (or loop through all to generate multiple articles)
-        topic_description = topics_descriptions[0]
-        topic, description = topic_description["topic"], topic_description["description"]
-
-        if not topic or not description:
-            return jsonify({"error": "Topic and description are required"}), 400
-
-        # Generate article using OpenAI
-        article_json = generate_article(topic, description)
+        results = []
         
-        # Save article to Google Drive
-        file_id = save_to_google_drive(article_json)
+        # Step 2: Process all topics
+        for topic_description in topics_descriptions:
+            topic, description = topic_description["topic"], topic_description["description"]
 
-        return jsonify({"message": "Article generated and saved to Google Drive", "file_id": file_id})
+            if not topic or not description:
+                continue  # Skip if data is incomplete
+
+            # Step 3: Generate an article using OpenAI
+            article_json = generate_article(topic, description)
+
+            # Step 4: Save the article to Google Drive
+            file_id = save_to_google_drive(article_json)
+
+            # Step 5: Collect results
+            results.append({
+                "topic": topic,
+                "status": "Article generated and saved",
+                "file_id": file_id
+            })
+
+        return jsonify({"message": "All articles processed", "results": results})
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/get_sheets_data", methods=["GET"])
-def get_sheets_data():
-    """ API to fetch Google Sheets data """
-    try:
-        data = get_google_sheets_data()
-        return jsonify({"topics_descriptions": data})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/test_openai", methods=["GET"])
-def test_openai():
-    """ Test OpenAI connection """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": "Say hello"}],
-            max_tokens=10
-        )
-        return jsonify({"status": "OpenAI connection successful", "response": response.choices[0].message.content})
-    except Exception as e:
-        return jsonify({"error": f"OpenAI connection failed: {str(e)}"}), 500
-
-@app.route("/test_sheets", methods=["GET"])
-def test_sheets():
-    """ Test Google Sheets connection """
-    try:
-        data = get_google_sheets_data()
-        return jsonify({"status": "Google Sheets connection successful", "data": data})
-    except Exception as e:
-        return jsonify({"error": f"Google Sheets connection failed: {str(e)}"}), 500
-
-@app.route("/test_google_auth", methods=["GET"])
-def test_google_auth():
-    """ Test Google authentication """
-    try:
-        sheets_service, drive_service = authenticate_google()
-        return jsonify({
-            "status": "Google authentication successful", 
-            "sheets_service": "Connected" if sheets_service else "Failed",
-            "drive_service": "Connected" if drive_service else "Failed"
-        })
-    except Exception as e:
-        return jsonify({"error": f"Google authentication failed: {str(e)}"}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=True)  # Run Flask app in debug mode
