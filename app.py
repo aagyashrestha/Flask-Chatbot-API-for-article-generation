@@ -1,172 +1,203 @@
-from flask import Flask, request, jsonify  # Importing necessary modules from Flask
-import openai  # Importing OpenAI module for article generation
-import json  # Importing JSON module for handling JSON data
-import io  # Importing IO module for handling in-memory byte streams
-from googleapiclient.discovery import build  # Importing build function from googleapiclient for Google API client
-from googleapiclient.http import MediaIoBaseUpload  # Importing MediaIoBaseUpload for uploading files to Google Drive
-from google.oauth2 import service_account  # Importing service_account for authenticating Google API access
 
-# Initialize Flask app
-app = Flask(__name__)  # Creating an instance of the Flask class for the web app
+import os
+import json
+import re
+from openai import OpenAI
+from flask import Flask, request, jsonify
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.http import MediaIoBaseUpload
+import io
 
-# OpenAI API Key
-OPENAI_API_KEY = ""  # Store OpenAI API key for GPT-3.5 access
-client = openai.OpenAI(api_key=OPENAI_API_KEY)  # Creating OpenAI client instance with the provided API key
+client = OpenAI(api_key="")  # Replace with your actual OpenAI API key
 
-SERVICE_ACCOUNT_FILE = "service_account.json"  # Path to the service account JSON file for Google API authentication
-# Google Sheets spreadsheet ID and range
-SPREADSHEET_ID = ''  # Google Sheets spreadsheet ID
-RANGE_NAME = 'Sheet1!A2:B'  # Range in the spreadsheet (columns A and B for topic/description)
-DRIVE_FOLDER_ID = ""  # Google Drive folder ID where generated articles will be saved
+app = Flask(__name__)
 
-def authenticate_google():
-    """ Authenticate Google Sheets and Google Drive services """
-    try:
-        SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]  # Define Google Sheets and Drive API scopes
-        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)  # Load credentials from service account file
+SPREADSHEET_ID = None
+DRIVE_FOLDER_ID = None
 
-        # Build the Google Sheets and Drive API services
-        sheets_service = build("sheets", "v4", credentials=creds)
-        drive_service = build("drive", "v3", credentials=creds)
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = 'service_account.json'
 
-        return sheets_service, drive_service  # Return both Google Sheets and Drive service instances
-    except Exception as e:
-        raise Exception(f"Google authentication error: {str(e)}")  # Handle authentication errors
+def get_google_sheets_service():
+    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    return build('sheets', 'v4', credentials=creds)
+
+def get_google_drive_service():
+    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    return build('drive', 'v3', credentials=creds)
+
+def extract_google_sheet_id(url):
+    match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    raise Exception("Invalid Google Sheets URL")
+
+def extract_google_drive_folder_id(url):
+    match = re.search(r'/folders/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    raise Exception("Invalid Google Drive Folder URL")
+
+def make_google_sheet_editable(sheet_id):
+    drive = get_google_drive_service()
+    permission = {'type': 'anyone', 'role': 'writer'}
+    drive.permissions().create(fileId=sheet_id, body=permission, fields='id').execute()
+
+def make_drive_folder_editable(folder_id):
+    drive = get_google_drive_service()
+    permission = {'type': 'anyone', 'role': 'writer'}
+    drive.permissions().create(fileId=folder_id, body=permission, fields='id').execute()
 
 def get_google_sheets_data():
-    """ Retrieve topics and descriptions from Google Sheets """
-    try:
-        sheets_service, _ = authenticate_google()  # Authenticate Google services
-        result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()  # Fetch data from Google Sheets
-        values = result.get("values", [])  # Get the list of rows from the response
+    service = get_google_sheets_service()
+    header = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Sheet1!1:1').execute()
+    header_row = header.get('values', [[]])[0]
 
-        # Create a list of dictionaries containing topic and description from the fetched rows
-        topics_descriptions = [{"topic": row[0], "description": row[1]} for row in values if len(row) >= 2]
-        return topics_descriptions  # Return the list of topics and descriptions
-    except Exception as e:
-        raise Exception(f"Failed to get Google Sheets data: {str(e)}")  # Handle errors when fetching data
+    topic_idx = description_idx = status_idx = link_idx = None
+    for i, col in enumerate(header_row):
+        name = col.strip().lower()
+        if name == 'topic':
+            topic_idx = i
+        elif name == 'description':
+            description_idx = i
+        elif name == 'status':
+            status_idx = i
+        elif name == 'link':
+            link_idx = i
+
+    if topic_idx is None or description_idx is None:
+        raise Exception("Missing 'topic' or 'description' columns.")
+
+    rows = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Sheet1!2:1000').execute()
+    values = rows.get('values', [])
+
+    data = []
+    for row in values:
+        topic = row[topic_idx] if len(row) > topic_idx else None
+        desc = row[description_idx] if len(row) > description_idx else None
+        status = row[status_idx] if status_idx is not None and len(row) > status_idx else ""
+        link = row[link_idx] if link_idx is not None and len(row) > link_idx else ""
+        if topic and desc and (not status or not link):
+            data.append({'topic': topic, 'description': desc})
+    return data
 
 def generate_article(topic, description):
-    """ Generate an article using OpenAI GPT-3.5 Turbo """
-    try:
-        prompt = f"Write an article about {topic} based on this description: {description}. Provide clear sections with headings."  # Create the prompt for GPT-3.5
-
-        # Make a request to OpenAI to generate the article
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a professional article writer."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1500,  # Limit response to 1500 tokens
-            temperature=0.7  # Set creativity of the response (0.7 is a balanced setting)
-        )
-
-        article = response.choices[0].message.content.strip()  # Extract the generated article from the response
-        sections = article.split("\n\n")  # Split article into sections based on double newlines
-        # Structure the article into title and sections
-        structured_article = {
-            "title": topic,
-            "sections": [{"heading": sec.split("\n")[0], "content": "\n".join(sec.split("\n")[1:])} for sec in sections if sec]
-        }
-        return structured_article  # Return the structured article
-    except Exception as e:
-        raise Exception(f"Failed to generate article: {str(e)}")  # Handle errors during article generation
+    prompt = f"Write an article about {topic} based on this description: {description}. Provide clear sections with headings."
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a professional article writer."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1500,
+        temperature=0.7
+    )
+    content = response.choices[0].message.content.strip()
+    sections = content.split("\n\n")
+    return {
+        "title": topic,
+        "sections": [{"heading": sec.split("\n")[0], "content": "\n".join(sec.split("\n")[1:])} for sec in sections if sec]
+    }
 
 def save_to_google_drive(article_json):
-    """ Save generated article as a JSON file to a specific folder in Google Drive """
-    try:
-        _, drive_service = authenticate_google()  # Authenticate Google services
+    service = get_google_drive_service()
+    file_name = f"{article_json['title']}_article.json"
+    file_data = json.dumps(article_json).encode()
+    media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype='application/json')
+    metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
+    file = service.files().create(body=metadata, media_body=media, fields='id').execute()
+    return file['id']
 
-        file_metadata = {
-            "name": f'{article_json["title"]}.json',  # Set the file name as the article title
-            "mimeType": "application/json",  # Set MIME type to JSON
-            "parents": [DRIVE_FOLDER_ID]  # Set the folder ID in which the file will be saved
-        }
+def update_sheet_with_results_dynamic(results):
+    service = get_google_sheets_service()
 
-        media = MediaIoBaseUpload(io.BytesIO(json.dumps(article_json).encode()), mimetype="application/json")  # Convert article to JSON format and prepare for upload
+    headers = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID, range='Sheet1!1:1'
+    ).execute().get('values', [[]])[0]
 
-        # Create and upload the file to Google Drive
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        return file.get("id")  # Return the file ID of the uploaded file
-    except Exception as e:
-        raise Exception(f"Failed to save to Google Drive: {str(e)}")  # Handle errors during file upload
+    topic_idx = status_idx = link_idx = None
+    for i, col in enumerate(headers):
+        name = col.strip().lower()
+        if name == 'topic':
+            topic_idx = i
+        elif name == 'status':
+            status_idx = i
+        elif name == 'link':
+            link_idx = i
 
-# Endpoint to test fetching data from Google Sheets
-@app.route("/get_google_sheets_data", methods=["GET"])
-def test_get_google_sheets_data():
-    try:
-        topics_descriptions = get_google_sheets_data()  # Fetch topics and descriptions from Google Sheets
-        if not topics_descriptions:
-            return jsonify({"error": "No data found in Google Sheets"}), 400  # Return error if no data is found
-        return jsonify({"data": topics_descriptions}), 200  # Return the data if successful
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500  # Return error if any exception occurs
+    if topic_idx is None or status_idx is None or link_idx is None:
+        raise Exception("Missing required columns: topic, status, or link.")
 
-# Endpoint to test OpenAI article generation
-@app.route("/generate_article", methods=["POST"])
-def test_generate_article():
-    try:
-        data = request.get_json()  # Get JSON data from the POST request
-        topic = data.get("topic")  # Extract topic from the request data
-        description = data.get("description")  # Extract description from the request data
-        
-        if not topic or not description:
-            return jsonify({"error": "Topic and description are required"}), 400  # Return error if topic or description is missing
-        
-        article_json = generate_article(topic, description)  # Generate the article based on the topic and description
-        return jsonify({"article": article_json}), 200  # Return the generated article as JSON
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500  # Return error if any exception occurs
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID, range='Sheet1!2:1000'
+    ).execute().get('values', [])
 
-# Endpoint to test saving to Google Drive
-@app.route("/save_to_drive", methods=["POST"])
-def test_save_to_drive():
-    try:
-        data = request.get_json()  # Get JSON data from the POST request
-        if not data:
-            return jsonify({"error": "Article data is required"}), 400  # Return error if article data is missing
-        
-        file_id = save_to_google_drive(data)  # Save the article data to Google Drive and get the file ID
-        return jsonify({"message": "File saved successfully", "file_id": file_id}), 200  # Return success message and file ID
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500  # Return error if any exception occurs
+    updated_rows = []
+    for row in rows:
+        topic_cell = row[topic_idx].strip().lower() if len(row) > topic_idx else None
+        match = next((r for r in results if r['topic'].strip().lower() == topic_cell), None)
 
-# Endpoint to automate the entire process
-@app.route("/automate_all", methods=["GET"])
+        if match:
+            while len(row) <= max(status_idx, link_idx):
+                row.append("")
+            row[status_idx] = match['status']
+            row[link_idx] = match['link'] or ""
+        updated_rows.append(row)
+
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f'Sheet1!2:{len(updated_rows)+1}',
+        valueInputOption='RAW',
+        body={'values': updated_rows}
+    ).execute()
+
+@app.route("/automate_all", methods=["POST"])
 def automate_all():
     try:
-        # Step 1: Fetch topics and descriptions from Google Sheets
+        data = request.get_json()
+        global SPREADSHEET_ID, DRIVE_FOLDER_ID
+        SPREADSHEET_ID = extract_google_sheet_id(data.get("sheet_url"))
+        DRIVE_FOLDER_ID = extract_google_drive_folder_id(data.get("drive_folder_url"))
+
+        #make_google_sheet_editable(SPREADSHEET_ID)
+        make_drive_folder_editable(DRIVE_FOLDER_ID)
+
         topics_descriptions = get_google_sheets_data()
         if not topics_descriptions:
-            return jsonify({"error": "No data found in Google Sheets"}), 400  # Return error if no data is found
+            return jsonify({"error": "No data found"}), 400
 
-        results = []  # Initialize a list to store results
-        
-        # Step 2: Process all topics
-        for topic_description in topics_descriptions:
-            topic, description = topic_description["topic"], topic_description["description"]
+        results = []
+        for item in topics_descriptions:
+            topic = item['topic']
+            description = item['description']
+            try:
+                article = generate_article(topic, description)
+                file_id = save_to_google_drive(article)
+                results.append({
+                    "topic": topic,
+                    "status": "Article generated and saved",
+                    "file_id": file_id,
+                    "link": f"https://drive.google.com/file/d/{file_id}/view"
+                })
+            except Exception as e:
+                print(f"[ERROR] Failed for topic '{topic}': {str(e)}")
+                results.append({
+                    "topic": topic,
+                    "status": "Error while generating article",
+                    "file_id": None,
+                    "link": "Error while generating link"
+                })
 
-            if not topic or not description:
-                continue  # Skip if topic or description is missing
+        update_sheet_with_results_dynamic(results)
 
-            # Step 3: Generate an article using OpenAI
-            article_json = generate_article(topic, description)
+        return jsonify({
+            "message": "All articles processed",
+            "results": results
+        })
 
-            # Step 4: Save the article to Google Drive
-            file_id = save_to_google_drive(article_json)
-
-            # Step 5: Collect results for each processed article
-            results.append({
-                "topic": topic,
-                "status": "Article generated and saved",
-                "file_id": file_id
-            })
-
-        return jsonify({"message": "All articles processed", "results": results})  # Return summary of results
-    
     except Exception as e:
-        return jsonify({"error": str(e)}), 500  # Return error if any exception occurs
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
-    app.run(debug=True)  # Run the Flask app in debug mode
+if __name__ == '__main__':
+    app.run(debug=True)
